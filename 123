@@ -1,0 +1,176 @@
+import numpy as np
+from CoolProp.CoolProp import PropsSI
+import matplotlib.pyplot as plt
+
+class H2O2SteamGenerator:
+    def __init__(self, diameter, length, cell_size, porosity):
+        """
+        Инициализация геометрии катализатора и физико-химических констант.
+        """
+        self.diameter = diameter  # Диаметр канала, м
+        self.length = length      # Длина катализатора, м
+        self.cell_size = cell_size  # Размер ячейки сетки, м
+        self.porosity = porosity    # Пористость катализатора
+        self.cross_area = np.pi * (diameter / 2) ** 2  # Поперечное сечение, м²
+
+        # Универсальная газовая постоянная (из CoolProp)
+        self.R = PropsSI("GAS_CONSTANT", "Water")  # Дж/(моль·К)
+
+        # Молярные массы (кг/моль)
+        self.M_H2O2 = 0.034016  # Перекись водорода (ручное задание)
+        self.M_H2O = PropsSI("MOLAR_MASS", "Water")
+        self.M_O2 = PropsSI("MOLAR_MASS", "Oxygen")
+
+        # Константы разложения H2O2
+        self.Ea = 50e3      # Энергия активации, Дж/моль
+        self.A_pre = 5e7    # Предэкспоненциальный множитель, 1/с
+        self.reaction_heat = 2884.5e3  # Теплота разложения, Дж/кг
+
+    def get_cp(self, fluid, T, P):
+        """Теплоёмкость при заданной температуре и давлении."""
+        return PropsSI("C", "T", T, "P", P, fluid)
+
+    def get_latent_heat(self, P):
+        """Удельная теплота парообразования воды при данном давлении."""
+        return PropsSI("H", "P", P, "Q", 1, "Water") - PropsSI("H", "P", P, "Q", 0, "Water")
+
+    def get_T_saturation(self, P):
+        """Температура насыщения воды при данном давлении."""
+        return PropsSI("T", "P", P, "Q", 0, "Water")
+
+    def compute_reaction_rate(self, T, concentration):
+        """Скорость разложения H₂O₂ по уравнению Аррениуса."""
+        k = self.A_pre * np.exp(-self.Ea / (self.R * T))
+        return k * concentration  # моль/(м³·с)
+
+    def compute_pressure_drop(self, velocity, viscosity, density):
+        """Перепад давления по уравнению Эргуна для двухфазной смеси."""
+        eps = self.porosity
+        dp = self.cell_size
+        visc_term = 150 * (1 - eps)**2 / eps**3 * viscosity * velocity / dp**2
+        inertial_term = 1.75 * (1 - eps) / eps**3 * density * velocity**2 / dp
+        return visc_term + inertial_term
+
+    def simulate_steady(self, mass_flow, h2o2_concentration=0.90, inlet_temp=293.15, inlet_pressure=5e6):
+        """
+        Основной метод расчёта: моделирует стационарное течение через катализатор.
+        """
+        segments = 100
+        dx = self.length / segments
+        T = inlet_temp
+        P = inlet_pressure
+
+        # Массовые потоки на входе
+        m_H2O2 = mass_flow * h2o2_concentration
+        m_H2O_liq = mass_flow * (1 - h2o2_concentration)
+        m_H2O_vap = 0.0
+        m_O2 = 0.0
+
+        # Профили по длине катализатора
+        T_profile, P_profile, alpha_profile = [], [], []
+
+        for _ in range(segments):
+            # Расходы и концентрации
+            rho_liq = 1300.0  # плотность перекиси с водой
+            V_liq = (m_H2O2 + m_H2O_liq) / rho_liq
+            n_O2 = m_O2 / self.M_O2
+            n_H2O_v = m_H2O_vap / self.M_H2O
+            V_gas = (n_O2 + n_H2O_v) * self.R * T / P if (n_O2 + n_H2O_v) > 0 else 0.0
+            V_total = V_liq + V_gas
+            u = V_total / self.cross_area  # средняя скорость
+
+            # Кинетика реакции
+            C_H2O2 = (m_H2O2 / self.M_H2O2) / V_liq if V_liq > 0 else 0.0
+            r_mol = self.compute_reaction_rate(T, C_H2O2)
+            r_mass = r_mol * self.M_H2O2
+            dm = min(r_mass * self.cross_area * self.porosity * dx, m_H2O2)
+
+            # Обновление масс
+            m_H2O2 -= dm
+            m_O2 += 0.4706 * dm
+            m_H2O_liq += 0.5294 * dm
+
+            # Тепловой расчёт
+            Q = dm * self.reaction_heat
+            T_sat = self.get_T_saturation(P)
+
+
+            if T < T_sat:
+                cp_liq = self.get_cp("Water", T, P)
+                m_total = m_H2O2 + m_H2O_liq + m_H2O_vap + m_O2
+                Q_required = m_total * cp_liq * (T_sat - T)
+                if Q >= Q_required:
+                    Q -= Q_required
+                    T = T_sat
+                else:
+                    T += Q / (m_total * cp_liq)
+                    Q = 0
+
+            # Испарение воды
+            if abs(T - T_sat) < 1e-6 and Q > 0 and m_H2O_liq > 0:
+                latent = self.get_latent_heat(P)
+                m_evap = min(Q / latent, m_H2O_liq)
+                m_H2O_liq -= m_evap
+                m_H2O_vap += m_evap
+                Q -= m_evap * latent
+
+            # Перегрев газа
+            if Q > 0:
+                cp_H2O = self.get_cp("Water", T, P)
+                cp_O2 = self.get_cp("Oxygen", T, P)
+                m_gas = m_H2O_vap + m_O2
+                cp_mix = (m_H2O_vap / m_gas * cp_H2O + m_O2 / m_gas * cp_O2) if m_gas > 0 else 0
+                T += Q / (m_gas * cp_mix) if cp_mix > 0 else 0
+                Q = 0
+
+            # Перепад давления
+            mu = 1e-3 * (1 - V_gas / V_total) + 2e-5 * (V_gas / V_total) if V_total > 0 else 1e-3
+            rho_eff = (m_H2O2 + m_H2O_liq + m_H2O_vap + m_O2) / V_total if V_total > 0 else 1000.0
+            dP_dx = self.compute_pressure_drop(u, mu, rho_eff)
+            P = max(P - dP_dx * dx, 0)
+
+            # Сохраняем профили
+            T_profile.append(T)
+            P_profile.append(P / 1e6)  # МПа
+            alpha_profile.append(1 - m_H2O2 / (mass_flow * h2o2_concentration))
+
+        return {
+            "outlet_temperature": T,
+            "outlet_pressure": P,
+            "H2O2_remaining_frac": m_H2O2 / (mass_flow * h2o2_concentration),
+            "liquid_water_out": m_H2O_liq,
+            "vapor_water_out": m_H2O_vap,
+            "O2_out": m_O2,
+            "T_profile": T_profile,
+            "P_profile": P_profile,
+            "alpha_profile": alpha_profile
+        }
+
+# Пример использования
+generator = H2O2SteamGenerator(diameter=0.170, length=0.15, cell_size=0.001, porosity=0.7)
+result = generator.simulate_steady(mass_flow=5.8, h2o2_concentration=0.90, inlet_temp=293.15, inlet_pressure=5e6)
+
+# Графики
+x = np.linspace(0, generator.length, len(result["T_profile"]))
+plt.figure(figsize=(12, 4))
+
+plt.subplot(1, 3, 1)
+plt.plot(x, result["T_profile"])
+plt.title("Температура вдоль катализатора")
+plt.xlabel("Длина, м")
+plt.ylabel("T, K")
+
+plt.subplot(1, 3, 2)
+plt.plot(x, result["P_profile"])
+plt.title("Давление вдоль катализатора")
+plt.xlabel("Длина, м")
+plt.ylabel("P, МПа")
+
+plt.subplot(1, 3, 3)
+plt.plot(x, result["alpha_profile"])
+plt.title("Степень разложения H₂O₂")
+plt.xlabel("Длина, м")
+plt.ylabel("α")
+
+plt.tight_layout()
+plt.show()
