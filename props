@@ -1,0 +1,85 @@
+def oxygen_methane_gg_props(pressure_gg, temperature_gg=None, Km_gg=None):
+    """
+    Calculates GG properties for oxygen-methane fuel-rich gas generator.
+
+    :param pressure_gg: GG pressure (Pa)
+    :param temperature_gg: GG temperature (K) [Optional]
+    :param Km_gg: GG mixture ratio [Optional]
+    :return:
+        Km_gg (float): GG mixture ratio (if not provided)
+        temperature_gg (float): GG temperature (K) (if not provided)
+        k_gg (float): GG heat capacity ratio
+        R_gg (float): GG gas constant (J/(kg*K))
+        Cp_gg (float): GG specific heat at constant pressure (J/(kg*K))
+    :raises ValueError: If inputs are invalid or out of range.
+    """
+    # Input validation
+    if temperature_gg is None and Km_gg is None:
+        raise ValueError("Either temperature_gg or Km_gg must be provided.")
+    if temperature_gg is not None and Km_gg is not None:
+        raise ValueError("Both temperature_gg and Km_gg cannot be provided simultaneously.")
+
+    # Automatically determine the path to the JSON file
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    json_path = os.path.join(current_dir, "LOX_LNG_fuel-rich_GG_data", "fuel_rich_gg_data.json")
+
+    # Load data from JSON file
+    with open(json_path, "r") as file:
+        data = json.load(file)
+
+    pressure_mpa = pressure_gg / 1e6
+
+    # Finding the nearest pressure ranges
+    pressures_available = sorted(float(p.replace(" MPa", "")) for p in data.keys())
+
+    if pressure_mpa < pressures_available[0] or pressure_mpa > pressures_available[-1]:
+        raise ValueError("Pressure is outside the range of available data.")
+
+    lower_pressure = max([p for p in pressures_available if p <= pressure_mpa])
+    upper_pressure = min([p for p in pressures_available if p >= pressure_mpa])
+
+    # Extract data for interpolation
+    lower_data = data[f"{lower_pressure} MPa"]
+    upper_data = data[f"{upper_pressure} MPa"]
+
+    # Interpolation function for parameters
+    def interpolate_param(param, temperature):
+        lower_interp = interp1d(lower_data['T_gg'], lower_data[param], fill_value="extrapolate")
+        upper_interp = interp1d(upper_data['T_gg'], upper_data[param], fill_value="extrapolate")
+        lower_value = lower_interp(temperature)
+        upper_value = upper_interp(temperature)
+        return np.interp(pressure_mpa, [lower_pressure, upper_pressure], [lower_value, upper_value])
+
+    # If temperature is provided
+    if temperature_gg is not None:
+        Km_gg = interpolate_param("Km_gg", temperature_gg)
+        k_gg = interpolate_param("k_gg", temperature_gg)
+        R_gg = interpolate_param("R_gg", temperature_gg)
+        Cp_gg = interpolate_param("Cp_gg", temperature_gg)
+    else:  # If Km_gg is provided, find the corresponding temperature
+        def find_temperature_for_Km(Km_target):
+            T_values = np.array(lower_data['T_gg'])
+            Km_values = np.array(lower_data['Km_gg'])
+            Km_interp = interp1d(Km_values, T_values, fill_value="extrapolate")
+            temperature_lower = Km_interp(Km_target)
+
+            Km_values = np.array(upper_data['Km_gg'])
+            T_values = np.array(upper_data['T_gg'])
+            Km_interp = interp1d(Km_values, T_values, fill_value="extrapolate")
+            temperature_upper = Km_interp(Km_target)
+
+            return np.interp(pressure_mpa, [lower_pressure, upper_pressure],
+                             [temperature_lower, temperature_upper])
+
+        temperature_gg = find_temperature_for_Km(Km_gg)
+        k_gg = interpolate_param("k_gg", temperature_gg)
+        R_gg = interpolate_param("R_gg", temperature_gg)
+        Cp_gg = interpolate_param("Cp_gg", temperature_gg)
+
+    return {
+        "Km_gg": Km_gg,
+        "temperature_gg": temperature_gg,
+        "k_gg": k_gg,
+        "R_gg": R_gg * 1.0E3,
+        "Cp_gg": Cp_gg * 1.0E3
+    }
